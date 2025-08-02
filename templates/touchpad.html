@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <!-- Basic page setup -->
+    <meta charset="UTF-8">
+    <title>Precision Touchpad</title>
+    <!-- Make sure it works well on mobile devices -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <style>
+        /* Reset and base styles */
+        body, html {
+            margin: 0;
+            padding: 0;
+            height: 100%;
+            background: #111;  /* Dark background for better visibility */
+            color: #fff;
+            font-family: -apple-system, BlinkMacSystemFont, sans-serif;  /* System fonts for native feel */
+            touch-action: none;  /* Disable browser touch behaviors */
+            overflow: hidden;  /* No scrolling allowed */
+        }
+        
+        /* The main touchpad area */
+        #touchSurface {
+            width: 100%;
+            height: 100%;
+            background: #222;  /* Slightly lighter than body */
+            position: relative;
+        }
+        
+        /* Help text at bottom */
+        .help-text {
+            position: absolute;
+            bottom: 10px;
+            left: 0;
+            right: 0;
+            text-align: center;
+            padding: 10px;
+            background: rgba(0,0,0,0.7);  /* Semi-transparent black */
+            font-size: 14px;
+            line-height: 1.5;
+        }
+        
+        /* Connection status indicator */
+        .conn-status {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background: rgba(0,0,0,0.7);
+            padding: 5px 10px;
+            border-radius: 10px;
+            font-size: 12px;
+        }
+        .connected { color: #0f0; }  /* Green when connected */
+        .disconnected { color: #f00; }  /* Red when disconnected */
+    </style>
+</head>
+<body>
+    <!-- Main touchpad container -->
+    <div id="touchSurface">
+        <!-- Connection status will update here -->
+        <div id="connState" class="conn-status disconnected">Disconnected</div>
+        
+        <!-- Quick usage instructions with intuitive emojis -->
+        <div class="help-text">
+            👆 Tap = Left Click &nbsp; | &nbsp; ✌️ Two-Finger Tap = Right Click &nbsp; | &nbsp; 👆➡️ Drag = Move &nbsp; | &nbsp; ✌️⬇️ Two-Finger Drag = Scroll
+        </div>
+    </div>
+
+    <!-- Socket.io client library -->
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+    <script>
+        // Set up our socket connection
+        const sock = io();
+        const pad = document.getElementById('touchSurface');
+        const statusEl = document.getElementById('connState');
+        
+        // Track all active touches
+        let touches = {};
+        let lastClick = 0;  // For double-click detection
+        let mightClick = false;  // Flag for potential click
+        const MOVE_THRESH = 5;  // How many pixels before we consider it a move (not a click)
+
+        // Scroll handling variables
+        let lastScrollTime = 0;
+        const SCROLL_THRESH = 1;  // Minimum scroll amount to register
+        const SCROLL_RATE_LIMIT = 8;  // Milliseconds between scroll events (~120Hz)
+        let lastScrollAmount = 0;
+        let scrollPoints = [];  // Could be used for momentum scrolling
+
+        // Update UI when connection status changes
+        sock.on('connect', () => {
+            statusEl.textContent = 'Connected 👍';
+            statusEl.classList.replace('disconnected', 'connected');
+        });
+
+        sock.on('disconnect', () => {
+            statusEl.textContent = 'Disconnected 😞';
+            statusEl.classList.replace('connected', 'disconnected');
+        });
+
+        // Set up touch event listeners
+        pad.addEventListener('touchstart', handleStart, { passive: false });
+        pad.addEventListener('touchmove', handleMove, { passive: false });
+        pad.addEventListener('touchend', handleEnd);
+        // Prevent context menu on long press
+        pad.addEventListener('contextmenu', e => e.preventDefault());
+
+        function handleStart(e) {
+            e.preventDefault();  // Stop any browser default behaviors
+            
+            // Store each new touch with its starting position
+            for (let t of e.changedTouches) {
+                touches[t.identifier] = {
+                    x: t.clientX,  // Current X
+                    y: t.clientY,  // Current Y
+                    startX: t.clientX,  // Original X for click detection
+                    startY: t.clientY,  // Original Y for click detection
+                    moved: false,  // Whether this touch has moved significantly
+                    time: Date.now(),  // When touch started (for click timing)
+                    prevY: t.clientY  // Previous Y position (for scroll calculations)
+                };
+            }
+            
+            // If it's a single touch, might be a click
+            if (e.touches.length === 1) {
+                mightClick = true;
+            }
+        }
+
+        function handleMove(e) {
+            e.preventDefault();
+            
+            const moves = [];  // Stores mouse movements to send to server
+            const now = performance.now();  // High precision timing
+            
+            // Process each moving touch
+            for (let t of e.changedTouches) {
+                if (!touches[t.identifier]) continue;
+                
+                const touch = touches[t.identifier];
+                // Calculate how much finger moved since last position
+                const dx = t.clientX - touch.x;
+                const dy = t.clientY - touch.y;
+                
+                // Update current position
+                touch.x = t.clientX;
+                touch.y = t.clientY;
+                
+                // Check if touch has moved enough to be considered a drag
+                const movedDist = Math.abs(t.clientX - touch.startX) + 
+                                 Math.abs(t.clientY - touch.startY);
+                if (movedDist > MOVE_THRESH) {
+                    touch.moved = true;
+                    mightClick = false;  // Too much movement for a click
+                }
+                
+                // If single touch, prepare mouse movement data
+                if (e.touches.length === 1) {
+                    moves.push({ dx, dy });
+                }
+            }
+            
+            // Send mouse movements if we have any
+            if (moves.length) {
+                sock.emit('move_batch', moves);
+            }
+            
+            // Handle two-finger scrolling
+            if (e.touches.length === 2) {
+                const t1 = touches[e.touches[0].identifier];
+                const t2 = touches[e.touches[1].identifier];
+                
+                if (t1 && t2) {
+                    // Calculate average vertical movement between both fingers
+                    const scrollDy = ((t1.y - t1.prevY) + (t2.y - t2.prevY)) / 2;
+                    
+                    // Remember current positions for next move event
+                    t1.prevY = t1.y;
+                    t2.prevY = t2.y;
+                    
+                    // Rate limit scroll events to avoid flooding
+                    if (now - lastScrollTime > SCROLL_RATE_LIMIT) {
+                        const scrollAmount = scrollDy * 1.5; // Boost sensitivity a bit
+                        
+                        // Only send if movement is significant enough
+                        if (Math.abs(scrollAmount) > SCROLL_THRESH) {
+                            sock.emit('scroll', { amount: scrollAmount });
+                            lastScrollTime = now;
+                        }
+                    }
+                }
+            }
+        }
+
+        function handleEnd(e) {
+            // Process each finger that was lifted
+            for (let t of e.changedTouches) {
+                if (!touches[t.identifier]) continue;
+                
+                const touch = touches[t.identifier];
+                delete touches[t.identifier];  // Clean up
+                
+                // Check if this was a quick tap in place (not a drag)
+                const isClick = !touch.moved && (Date.now() - touch.time) < 300;
+                
+                // Single finger click handling
+                if (isClick && e.touches.length === 0) {
+                    const now = Date.now();
+                    // Check for double click
+                    if (now - lastClick < 300) {
+                        sock.emit('double_click');
+                        lastClick = 0;  // Reset to prevent triple-click
+                    } else {
+                        sock.emit('left_click');
+                        lastClick = now;
+                    }
+                }
+                
+                // Two-finger tap (right click) detection
+                if (isClick && Object.keys(touches).length === 1) {
+                    sock.emit('right_click');
+                }
+            }
+        }
+    </script>
+</body>
+</html>
